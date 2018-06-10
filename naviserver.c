@@ -32,13 +32,15 @@
 #include "ns.h"
 #include "nsd.h"
 
+static Ns_ThreadArgProc ThreadArgProc;
+
 static value
-copy_string2(char *str)
+copy_string2(const char *str)
 {
    return copy_string(str ? str : "");
 }
 
-static char *
+static const char *
 GetServer()
 {
    Ns_Conn *conn = Ns_GetConn();
@@ -51,14 +53,14 @@ static NsInterp *
 GetInterp()
 {
    Ns_Conn *conn = Ns_GetConn();
-   if(conn) return NsGetInterp(Ns_GetConnInterp(conn));
-   return NsGetInterp(Ns_TclAllocateInterp(GetServer()));
+   if(conn) return NsGetInterpData(Ns_GetConnInterp(conn));
+   return NsGetInterpData(Ns_TclAllocateInterp(GetServer()));
 }
 
 static void
-ThreadArgProc(Tcl_DString *dsPtr, void *proc, void *arg)
+ThreadArgProc(Tcl_DString *dsPtr, Ns_ThreadProc proc, const void *arg)
 {
-    Ns_GetProcInfo(dsPtr, proc, arg);
+    Ns_GetProcInfo(dsPtr, (Ns_Callback *)proc, arg);
 }
 
 CAMLprim value
@@ -66,12 +68,12 @@ Ns_Eval_OCaml(value oscript)
 {
     CAMLparam1(oscript);
     CAMLlocal1(retval);
-    char *result = "";
+    const char *result = "";
     NsInterp *itPtr;
 
     if((itPtr = GetInterp())) {
       if(Tcl_EvalEx(itPtr->interp,String_val(oscript),-1,0) != TCL_OK)
-        result = Ns_TclLogError(itPtr->interp);
+        result = Ns_TclLogErrorInfo(itPtr->interp, "\n(context: eval OCaml)");
       else
         result = (char *)Tcl_GetStringResult(itPtr->interp);
     }
@@ -93,7 +95,7 @@ Ns_Log_OCaml(value olevel,value ostr)
     if(!strcasecmp(level,"Notice")) clevel = Notice; else
     if(!strcasecmp(level,"Warning")) clevel = Warning; else
     if(!strcasecmp(level,"Fatal")) clevel = Fatal;
-    Ns_Log(clevel,str);
+    Ns_Log(clevel, "%s", str);
     CAMLreturn(Val_unit);
 }
 
@@ -104,7 +106,7 @@ Ns_Info_OCaml(value oname)
     CAMLlocal1(retval);
     Tcl_DString ds;
     NsServer *servPtr;
-    char *result = "";
+    const char *result = "";
 
     static CONST char *cmds[] = {
         "address", "argv0", "boottime", "builddate", "callbacks",
@@ -156,7 +158,7 @@ Ns_Info_OCaml(value oname)
         if(!(result = Ns_InfoHostname())) result = "";
         break;
      case ILabelIdx:
-        if(!(result = Ns_InfoLabel())) result = "";
+        if(!(result = Ns_InfoTag())) result = "";
         break;
      case ILocksIdx:
         Ns_MutexList(&ds);
@@ -166,11 +168,11 @@ Ns_Info_OCaml(value oname)
         if(!(result = Ns_InfoErrorLog())) result = "";
         break;
      case IMajorIdx:
-        Ns_DStringPrintf(&ds,"%ld",NS_MAJOR_VERSION);
+        Ns_DStringPrintf(&ds,"%d",NS_MAJOR_VERSION);
         result = ds.string;
         break;
      case IMinorIdx:
-        Ns_DStringPrintf(&ds,"%ld",NS_MINOR_VERSION);
+        Ns_DStringPrintf(&ds,"%d",NS_MINOR_VERSION);
         result = ds.string;
         break;
      case INameIdx:
@@ -186,7 +188,7 @@ Ns_Info_OCaml(value oname)
         result = NS_PATCH_LEVEL;
         break;
      case IPidIdx:
-        Ns_DStringPrintf(&ds,"%ld",Ns_InfoPid());
+        Ns_DStringPrintf(&ds,"%d",Ns_InfoPid());
         result = ds.string;
         break;
      case IPlatformIdx:
@@ -238,6 +240,219 @@ Ns_Info_OCaml(value oname)
     CAMLreturn(retval);
 }
 
+
+static void
+AppendConn(Tcl_DString *dsPtr, const Conn *connPtr, const char *state, bool checkforproxy)
+{
+    Ns_Time now, diff;
+
+    NS_NONNULL_ASSERT(dsPtr != NULL);
+    NS_NONNULL_ASSERT(state != NULL);
+
+    /*
+     * An annoying race condition can be lethal here.
+     *
+     * In the state "waiting", we have never a connPtr->reqPtr, therefore we
+     * can't even determine the peer address, nor the request method or the
+     * request URL. Furthermore, there is no way to honor the "checkforproxy"
+     * flag.
+     */
+    if (connPtr != NULL) {
+        Tcl_DStringStartSublist(dsPtr);
+
+        if (connPtr->reqPtr != NULL) {
+            Tcl_DStringAppendElement(dsPtr, connPtr->idstr);
+
+            /*
+             * The settings of (connPtr->flags & NS_CONN_CONFIGURED) is
+             * protected via the mutex connPtr->poolPtr->tqueue.lock from the
+             * caller, so the protected members can't be changed from another
+             * thread.
+             */
+            if ((connPtr->flags & NS_CONN_CONFIGURED) != 0u) {
+                const char *p;
+
+                if ( checkforproxy ) {
+                    /*
+                     * When the connection is NS_CONN_CONFIGURED, the headers
+                     * have to be always set.
+                     */
+                    assert(connPtr->headers != NULL);
+                    p = Ns_SetIGet(connPtr->headers, "X-Forwarded-For");
+
+                    if (p == NULL || (*p == '\0') || strcasecmp(p, "unknown") == 0) {
+                        /*
+                         * Lookup of header field failed, use upstream peer
+                         * address.
+                         */
+                        p = Ns_ConnPeerAddr((const Ns_Conn *) connPtr);
+                    }
+                } else {
+                    p = Ns_ConnPeerAddr((const Ns_Conn *) connPtr);
+                }
+                Tcl_DStringAppendElement(dsPtr, p);
+            } else {
+                /*
+                 * The request is not configured, the headers might not be
+                 * fully processed. In this situation we can determine the
+                 * peer address, but not the header fields.
+                 */
+                if (checkforproxy ) {
+                    /*
+                     * The user requested "checkforproxy", but we can't. Since
+                     * we assume that the user uses this option typically when
+                     * running behind a proxy, we do not want to return here
+                     * the peer address, which might be incorrect. So we
+                     * append "unknown" as in other semi-processed cases.
+                     */
+                    Ns_Log(Notice, "Connection is not configured, we can't check for the proxy yet");
+                    Tcl_DStringAppendElement(dsPtr, "unknown");
+                } else {
+                    /*
+                     * Append the peer address, which is part of the reqPtr
+                     * and unrelated with the configured state.
+                     */
+                    Tcl_DStringAppendElement(dsPtr, Ns_ConnPeerAddr((const Ns_Conn *) connPtr));
+                }
+            }
+        } else {
+            /*
+             * connPtr->reqPtr == NULL. Having no connPtr->reqPtr is normal
+             * for "queued" requests but not for "running" requests. Report this in the error log.
+             */
+            Tcl_DStringAppendElement(dsPtr, "unknown");
+            if (*state == 'r') {
+                Ns_Log(Notice,
+                       "AppendConn state '%s': request not available, can't determine peer address",
+                       state);
+            }
+        }
+
+        Tcl_DStringAppendElement(dsPtr, state);
+
+        if (connPtr->request.line != NULL) {
+            Tcl_DStringAppendElement(dsPtr, (connPtr->request.method != NULL) ? connPtr->request.method : "?");
+            Tcl_DStringAppendElement(dsPtr, (connPtr->request.url    != NULL) ? connPtr->request.url : "?");
+        } else {
+            /* Ns_Log(Notice, "AppendConn: no request in state %s; ignore conn in output", state);*/
+            Tcl_DStringAppendElement(dsPtr, "unknown");
+            Tcl_DStringAppendElement(dsPtr, "unknown");
+        }
+        Ns_GetTime(&now);
+        Ns_DiffTime(&now, &connPtr->requestQueueTime, &diff);
+        Ns_DStringNAppend(dsPtr, " ", 1);
+        Ns_DStringAppendTime(dsPtr, &diff);
+        Ns_DStringPrintf(dsPtr, " %" PRIuz, connPtr->nContentSent);
+
+        Tcl_DStringEndSublist(dsPtr);
+    }
+}
+static void
+AppendConnList(Tcl_DString *dsPtr, const Conn *firstPtr, const char *state, bool checkforproxy)
+{
+    NS_NONNULL_ASSERT(dsPtr != NULL);
+    NS_NONNULL_ASSERT(state != NULL);
+
+    while (firstPtr != NULL) {
+        AppendConn(dsPtr, firstPtr, state, checkforproxy);
+        firstPtr = firstPtr->nextPtr;
+    }
+}
+static void
+ServerListActive(Tcl_DString *dsPtr, ConnPool *poolPtr, bool checkforproxy)
+{
+    int i;
+
+    NS_NONNULL_ASSERT(dsPtr != NULL);
+    NS_NONNULL_ASSERT(poolPtr != NULL);
+
+    Ns_MutexLock(&poolPtr->tqueue.lock);
+    for (i = 0; i < poolPtr->threads.max; i++) {
+        const ConnThreadArg *argPtr = &poolPtr->tqueue.args[i];
+
+        if (argPtr->connPtr != NULL) {
+            AppendConnList(dsPtr, argPtr->connPtr, "running", checkforproxy);
+        }
+    }
+    Ns_MutexUnlock(&poolPtr->tqueue.lock);
+}
+
+static void
+ServerListQueued(Tcl_DString *dsPtr, ConnPool *poolPtr)
+{
+    NS_NONNULL_ASSERT(dsPtr != NULL);
+    NS_NONNULL_ASSERT(poolPtr != NULL);
+
+    Ns_MutexLock(&poolPtr->wqueue.lock);
+    AppendConnList(dsPtr, poolPtr->wqueue.wait.firstPtr, "queued", NS_FALSE);
+    Ns_MutexUnlock(&poolPtr->wqueue.lock);
+}
+static int
+ServerListActiveCmd(Tcl_DString *dsPtr, Tcl_Interp *interp, int objc, Tcl_Obj *const* objv,
+                 ConnPool *poolPtr, int nargs)
+{
+    int         result = TCL_OK, checkforproxy = (int)NS_FALSE;
+    Ns_ObjvSpec opts[] = {
+        {"-checkforproxy", Ns_ObjvBool, &checkforproxy, INT2PTR(NS_TRUE)},
+        {NULL, NULL,  NULL, NULL}
+    };
+
+    NS_NONNULL_ASSERT(dsPtr != NULL);
+    NS_NONNULL_ASSERT(interp != NULL);
+    NS_NONNULL_ASSERT(objv != NULL);
+    NS_NONNULL_ASSERT(poolPtr != NULL);
+
+    if (Ns_ParseObjv(opts, NULL, interp, objc-nargs, objc, objv) != NS_OK) {
+        result = TCL_ERROR;
+    } else {
+        ServerListActive(dsPtr, poolPtr, (bool)checkforproxy);
+    }
+    return result;
+}
+
+static int
+ServerListQueuedCmd(Tcl_DString *dsPtr, Tcl_Interp *interp, int objc, Tcl_Obj *const* objv,
+                 ConnPool *poolPtr, int nargs)
+{
+    int result = TCL_OK;
+
+    NS_NONNULL_ASSERT(dsPtr != NULL);
+    NS_NONNULL_ASSERT(interp != NULL);
+    NS_NONNULL_ASSERT(objv != NULL);
+    NS_NONNULL_ASSERT(poolPtr != NULL);
+
+    if (Ns_ParseObjv(NULL, NULL, interp, objc-nargs, objc, objv) != NS_OK) {
+        result = TCL_ERROR;
+    } else {
+        ServerListQueued(dsPtr, poolPtr);
+    }
+    return result;
+}
+
+static int
+ServerListAllCmd(Tcl_DString *dsPtr, Tcl_Interp *interp, int objc, Tcl_Obj *const* objv,
+                 ConnPool *poolPtr, int nargs)
+{
+    int         result = TCL_OK, checkforproxy = (int)NS_FALSE;
+    Ns_ObjvSpec opts[] = {
+        {"-checkforproxy", Ns_ObjvBool, &checkforproxy, INT2PTR(NS_TRUE)},
+        {NULL, NULL,  NULL, NULL}
+    };
+
+    NS_NONNULL_ASSERT(dsPtr != NULL);
+    NS_NONNULL_ASSERT(interp != NULL);
+    NS_NONNULL_ASSERT(objv != NULL);
+    NS_NONNULL_ASSERT(poolPtr != NULL);
+
+    if (Ns_ParseObjv(opts, NULL, interp, objc-nargs, objc, objv) != NS_OK) {
+        result = TCL_ERROR;
+    } else {
+        ServerListActive(dsPtr, poolPtr, (bool)checkforproxy);
+        ServerListQueued(dsPtr, poolPtr);
+    }
+    return result;
+}
+
 CAMLprim value
 Ns_Server_OCaml(value oname)
 {
@@ -253,7 +468,7 @@ Ns_Server_OCaml(value oname)
     } opt;
     char buf[100];
     Conn *connPtr;
-    Tcl_DString ds;
+    Tcl_DString ds, *dsPtr = &ds;
     NsServer *servPtr;
     ConnPool *poolPtr;
     char *result = "";
@@ -266,37 +481,31 @@ Ns_Server_OCaml(value oname)
     switch(opt) {
      case INoneIdx:
         break;
-     case SQueuedIdx:
-     case SActiveIdx:
-     case SAllIdx:
-        if(!(servPtr = NsGetServer(GetServer()))) break;
-        Ns_MutexLock(&servPtr->pools.lock);
-        connPtr = servPtr->pools.defaultPtr->queue.active.firstPtr;
-        while(connPtr) {
-          Ns_GetTime(&now);
-          Ns_DiffTime(&now, &connPtr->startTime, &diff);
-          Ns_DStringPrintf(&ds,"%d %s running %s %s %ld.%ld %d",
-             connPtr->id,
-             Ns_ConnPeer((Ns_Conn *)connPtr),
-             connPtr->request && connPtr->request->method ? connPtr->request->method : "?",
-             connPtr->request && connPtr->request->url ? connPtr->request->url : "?",
-             diff.sec,
-             diff.usec,
-             connPtr->nContentSent);
-          connPtr = connPtr->nextPtr;
-        }
-        Ns_MutexUnlock(&servPtr->pools.lock);
-        result = ds.string;
+    case SActiveIdx:
+        if (ServerListActiveCmd(dsPtr, GetInterp()->interp, 0, NULL, poolPtr, 0) == NS_OK) {
+	  result = ds.string;
+	}
         break;
+    case SQueuedIdx:
+        if (ServerListQueuedCmd(dsPtr, GetInterp()->interp, 0, NULL, poolPtr, 0) == NS_OK) {
+	  result = ds.string;
+	}
+        break;
+
+    case SAllIdx:
+        if (ServerListAllCmd(dsPtr, GetInterp()->interp, 0, NULL, poolPtr, 0) == NS_OK) {
+	  result = ds.string;
+	}
+        break;	
      case SConnectionsIdx:
         if(!(servPtr = NsGetServer(GetServer()))) break;
         Ns_MutexLock(&servPtr->pools.lock);
-        Ns_DStringPrintf(&ds,"%d",servPtr->pools.nextconnid);
+        Ns_DStringPrintf(&ds,"%lu",servPtr->pools.nextconnid);
         Ns_MutexUnlock(&servPtr->pools.lock);
         result = ds.string;
         break;
      case SKeepaliveIdx:
-        Ns_DStringPrintf(&ds,"%d",nsconf.keepalive.npending);
+        Ns_DStringPrintf(&ds,"%d",0);
         result = ds.string;
         break;
      case SPoolsIdx:
@@ -321,7 +530,7 @@ Ns_Server_OCaml(value oname)
      case SWaitingIdx:
         if(!(servPtr = NsGetServer(GetServer()))) break;
         Ns_MutexLock(&servPtr->pools.lock);
-        Ns_DStringPrintf(&ds,"%d",servPtr->pools.defaultPtr->queue.wait.num);
+        Ns_DStringPrintf(&ds,"%d",servPtr->pools.defaultPtr->wqueue.wait.num);
         Ns_MutexUnlock(&servPtr->pools.lock);
         result = ds.string;
         break;
@@ -342,7 +551,7 @@ Ns_Conn_OCaml(value oname)
     Ns_Conn *conn;
     Tcl_DString ds;
     NsInterp *itPtr;
-    char *result = "";
+    const char *result = "";
     Tcl_HashEntry *hPtr;
     Tcl_HashSearch search;
 
@@ -353,7 +562,7 @@ Ns_Conn_OCaml(value oname)
 	 "host", "id", "isconnected", "location", "method",
 	 "outputheaders", "peeraddr", "peerport", "port", "protocol",
 	 "query", "request", "server", "sock", "start", "status",
-	 "url", "urlc", "urlencoding", "urlv", "version", "write_encoded",
+	 "url", "urlc", "urlencoding", "urlv", "version", //"write_encoded",
          0
     };
     enum ISubCmdIdx {
@@ -364,14 +573,15 @@ Ns_Conn_OCaml(value oname)
 	 CLocationIdx, CMethodIdx, COutputHeadersIdx, CPeerAddrIdx,
 	 CPeerPortIdx, CPortIdx, CProtocolIdx, CQueryIdx, CRequestIdx,
 	 CServerIdx, CSockIdx, CStartIdx, CStatusIdx, CUrlIdx,
-	 CUrlcIdx, CUrlEncodingIdx, CUrlvIdx, CVersionIdx, CWriteEncodedIdx,
+	 CUrlcIdx, CUrlEncodingIdx, CUrlvIdx, CVersionIdx, //CWriteEncodedIdx,
          INoneIdx
     } opt;
 
     for(opt = 0;cmds[opt];opt++)
       if(!strcmp(cmds[opt],String_val(oname))) break;
 
-    connPtr = (Conn*)conn = Ns_GetConn();
+    conn = Ns_GetConn();
+    connPtr = (Conn*)conn;
 
     if(opt != CIsConnectedIdx && !connPtr) CAMLreturn(copy_string(result));
 
@@ -385,16 +595,15 @@ Ns_Conn_OCaml(value oname)
 	break;
 		
      case CUrlvIdx:
-     	for(idx = 0; idx < connPtr->request->urlc; idx++)
-	  Ns_DStringPrintf(&ds,"%s ",connPtr->request->urlv[idx]);
+        Ns_DStringPrintf(&ds,"%s ",connPtr->request.urlv);
         break;
 
      case CAuthUserIdx:
-	result = connPtr->authUser;
+        result = Ns_ConnAuthUser(conn);
 	break;
 	    
      case CAuthPasswordIdx:
-	result = connPtr->authPasswd;
+	result = Ns_ConnAuthPasswd(conn);
         break;
 
      case CContentIdx:
@@ -402,12 +611,12 @@ Ns_Conn_OCaml(value oname)
         break;
 	    
      case CContentLengthIdx:
-	Ns_DStringPrintf(&ds,"%d",conn->contentLength);
+	Ns_DStringPrintf(&ds,"%lu",conn->contentLength);
         result = ds.string;
         break;
 
      case CEncodingIdx:
-	if(connPtr->encoding) result = (char *)Tcl_GetEncodingName(connPtr->encoding);
+	if(connPtr->outputEncoding) result = (char *)Tcl_GetEncodingName(connPtr->outputEncoding);
         break;
 	
      case CUrlEncodingIdx:
@@ -415,7 +624,7 @@ Ns_Conn_OCaml(value oname)
         break;
 	
      case CPeerAddrIdx:
-	result = Ns_ConnPeer(conn);
+	result = Ns_ConnPeerAddr(conn);
         break;
 	
      case CPeerPortIdx:
@@ -478,51 +687,52 @@ Ns_Conn_OCaml(value oname)
      case CCopyIdx:
         break;
 
-     case CWriteEncodedIdx:
-        result = Ns_ConnGetWriteEncodedFlag(conn) ? "true" : "false";
-        break;
+	//case CWriteEncodedIdx:
+        //result = Ns_ConnGetWriteEncodedFlag(conn) ? "true" : "false";
+        //break;
 
      case CRequestIdx:
-	result = conn->request->line;
+	result = conn->request.line;
         break;
 
      case CMethodIdx:
-	result = conn->request->method;
+	result = conn->request.method;
 	break;
 
      case CProtocolIdx:
-	result = conn->request->protocol;
+	result = conn->request.protocol;
 	break;
 
      case CHostIdx:
-	result = conn->request->host;
+        result = Ns_ConnHost(conn);
 	break;
 	
      case CPortIdx:
-	Ns_DStringPrintf(&ds,"%d",conn->request->port);
+        Ns_DStringPrintf(&ds,"%hu",Ns_ConnPort(conn));
         result = ds.string;
         break;
 
      case CUrlIdx:
-	result = conn->request->url;
+	result = conn->request.url;
         break;
 	
      case CQueryIdx:
-	result = conn->request->query;
+	result = conn->request.query;
 	break;
 	
      case CUrlcIdx:
-	Ns_DStringPrintf(&ds,"%d",conn->request->urlc);
+	Ns_DStringPrintf(&ds,"%d",conn->request.urlc);
         result = ds.string;
         break;
 	
      case CVersionIdx:
-	Ns_DStringPrintf(&ds,"%.2f",conn->request->version);
+	Ns_DStringPrintf(&ds,"%.2f",conn->request.version);
         result = ds.string;
         break;
 
      case CLocationIdx:
-	result = Ns_ConnLocation(conn);
+        result = Ns_ConnLocationAppend(conn, &ds);
+	result = ds.string;
         break;
 
      case CDriverIdx:
@@ -544,7 +754,7 @@ Ns_Conn_OCaml(value oname)
         break;
 	
      case CIdIdx:
-	Ns_DStringPrintf(&ds,"%d",Ns_ConnId(conn));
+	Ns_DStringPrintf(&ds,"%" PRIiPTR,Ns_ConnId(conn));
         result = ds.string;
         break;
 	
@@ -554,7 +764,7 @@ Ns_Conn_OCaml(value oname)
         break;
 
      case CStartIdx:
-	Ns_DStringPrintf(&ds,"%ld",connPtr->startTime.sec);
+	Ns_DStringPrintf(&ds,"%ld",connPtr->requestQueueTime.sec);
         result = ds.string;
         break;
 
@@ -693,7 +903,8 @@ Ns_UrlEncode_OCaml(value ostr)
     Ns_DString ds;
 
     Ns_DStringInit(&ds);
-    Ns_EncodeUrlCharset(&ds,String_val(ostr),0);
+
+    Ns_UrlQueryEncode(&ds, String_val(ostr), NS_utf8Encoding);
     retval = copy_string(ds.string);
     Ns_DStringFree(&ds);
     CAMLreturn(retval);
@@ -707,7 +918,7 @@ Ns_UrlDecode_OCaml(value ostr)
     Ns_DString ds;
 
     Ns_DStringInit(&ds);
-    Ns_DecodeUrlCharset(&ds,String_val(ostr),0);
+    Ns_UrlQueryDecode(&ds,String_val(ostr),NS_utf8Encoding);
     retval = copy_string(ds.string);
     Ns_DStringFree(&ds);
     CAMLreturn(retval);
@@ -718,7 +929,7 @@ Ns_Config_OCaml(value osection,value okey)
 {
     CAMLparam2(osection,okey);
     CAMLlocal1(retval);
-    char *result = Ns_ConfigGetValue(String_val(osection),String_val(okey));
+    const char *result = Ns_ConfigGetValue(String_val(osection),String_val(okey));
     retval = copy_string2(result);
     CAMLreturn(retval);
 }
@@ -728,7 +939,7 @@ Ns_GuessType_OCaml(value otype)
 {
     CAMLparam1(otype);
     CAMLlocal1(retval);
-    char *result = Ns_GetMimeType(String_val(otype));
+    const char *result = Ns_GetMimeType(String_val(otype));
     retval = copy_string2(result);
     CAMLreturn(retval);
 }

@@ -40,9 +40,14 @@
 
 #define NSOCAML_VERSION  "0.2"
 
-static int OCAMLHandler(void *arg,Ns_Conn *conn);
-static int OCAMLInterpInit(Tcl_Interp *interp,void *context);
-static int OCAMLCmd(void *context,Tcl_Interp *interp,int objc,Tcl_Obj * CONST objv[]);
+NS_EXPORT Ns_ModuleInitProc Ns_ModuleInit;
+
+static Ns_OpProc OCAMLHandler;
+static Ns_TclTraceProc OCAMLInterpInit;
+
+//static int OCAMLHandler(void *arg,Ns_Conn *conn);
+//static int OCAMLInterpInit(Tcl_Interp *interp,void *context);
+static int OCAMLCmd(void *context,Tcl_Interp *interp,int objc,Tcl_Obj * const objv[]);
 
 static Ns_Mutex ocamlLock;
 static value *ocamlLoader;
@@ -50,11 +55,12 @@ static value *ocamlLoader;
 NS_EXPORT int Ns_ModuleVersion = 1;
 
 NS_EXPORT int
-Ns_ModuleInit(char *server, char *module)
+Ns_ModuleInit(const char *server, const char *module)
 {
     Ns_DString ds;
     NsServer *servPtr;
-    char *path, *argv[] = { 0, 0, 0 };
+    char *argv[] = { 0, 0, 0 };
+    const char *path;
 
     path = Ns_ConfigGetPath(server,module,NULL);
     // Initialize OCaml dynamic loader
@@ -78,14 +84,14 @@ Ns_ModuleInit(char *server, char *module)
 }
 
 static int
-OCAMLInterpInit(Tcl_Interp *interp, void *context)
+OCAMLInterpInit(Tcl_Interp *interp, const void *context)
 {
-    Tcl_CreateObjCommand(interp,"ns_ocaml",OCAMLCmd,context,NULL);
+    Tcl_CreateObjCommand(interp,"ns_ocaml",OCAMLCmd,(void *)context,NULL);
     return NS_OK;
 }
 
 static int
-OCAMLCmd(void *context,Tcl_Interp *interp,int objc,Tcl_Obj * CONST objv[])
+OCAMLCmd(ClientData UNUSED(clientData), Tcl_Interp *interp,int objc,Tcl_Obj * const objv[])
 {
     int cmd;
     value *fn, res, arg = Val_unit;
@@ -143,24 +149,25 @@ OCAMLCmd(void *context,Tcl_Interp *interp,int objc,Tcl_Obj * CONST objv[])
     return TCL_OK;
 }
 
-static int
-OCAMLHandler(void *arg,Ns_Conn *conn)
+static Ns_ReturnCode
+OCAMLHandler(const void *arg, Ns_Conn *conn)
 {
    value res,file;
    Ns_DString ds;
-   NsServer *servPtr = arg;
+   const NsServer *servPtr = arg;
 
    Ns_DStringInit(&ds);
-   Ns_MakePath(&ds,servPtr->fastpath.pageroot,conn->request->url,NULL);
+   Ns_MakePath(&ds,servPtr->fastpath.pageroot,conn->request.url,NULL);
    if(access(ds.string,R_OK) != 0) goto notfound;
    file = copy_string(ds.string);
    Ns_MutexLock(&ocamlLock);
    res = callback_exn(*ocamlLoader,file);
    Ns_MutexUnlock(&ocamlLock);
    if(Is_exception_result(res)) {
-     char *msg = format_caml_exception(Extract_exception(res));
+     const char *msg = format_caml_exception(Extract_exception(res));
+
      Ns_Log(Error,"nsocaml: %s: %s",ds.string,msg);
-     free(msg);
+     free((char *)msg);
      return TCL_ERROR;
    }
    // OCaml module id not produce any HTTP response, return internal error then

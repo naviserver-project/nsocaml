@@ -18,7 +18,7 @@ MOD		= nsocaml.so
 BUILD		+= naviserver.cma
 CLEAN		+= clean-ocaml
 CFLAGS	 	= -I$(OCAMLHOME)
-OBJS     	= nsocaml.o
+MODOBJS     	= nsocaml.o
 MODLIBS		= -L$(OCAMLHOME) -lcamlrun -ltermcap -lunix -lstr -lnaviserver
 
 NSLIB		= naviserver
@@ -26,8 +26,8 @@ NSLIB		= naviserver
 include  $(NAVISERVER)/include/Makefile.module
 
 # Custom compilcation of Naviserver module
-nsocaml.so: $(OCAMLOBJS) $(OBJS) install-ocaml
-	$(OCAMLC) -linkall -custom $(OCAMLCFLAGS) $(OBJS) $(OCAMLMODS) $(OCAMLOBJS) -o $@ $(OCAMLLDFLAGS)
+nsocaml.so: $(OCAMLOBJS) $(MODOBJS) install-ocaml
+	$(OCAMLC) -linkall -custom $(OCAMLCFLAGS) $(MODOBJS) $(OCAMLMODS) $(OCAMLOBJS) -o $@ $(OCAMLLDFLAGS)
 
 $(NSLIB).cma:	$(NSLIB).cmo $(NSLIB).o $(NSLIB).ml
 	$(OCAMLMKLIB) -o $(NSLIB) $(NSLIB).cmo
