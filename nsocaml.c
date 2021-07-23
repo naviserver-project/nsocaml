@@ -54,7 +54,7 @@ static value *ocamlLoader;
 
 NS_EXPORT int Ns_ModuleVersion = 1;
 
-NS_EXPORT int
+NS_EXPORT Ns_ReturnCode
 Ns_ModuleInit(const char *server, const char *module)
 {
     Ns_DString ds;
@@ -83,7 +83,7 @@ Ns_ModuleInit(const char *server, const char *module)
     return NS_OK;
 }
 
-static int
+static Ns_ReturnCode
 OCAMLInterpInit(Tcl_Interp *interp, const void *context)
 {
     Tcl_CreateObjCommand(interp,"ns_ocaml",OCAMLCmd,(void *)context,NULL);
