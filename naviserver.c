@@ -657,7 +657,7 @@ Ns_Conn_OCaml(value oname)
      case CFormIdx:
         itPtr = GetInterp();
 	if(!(itPtr->nsconn.flags & CONN_TCLFORM)) {
-      	  form = Ns_ConnGetQuery(conn);
+	  form = Ns_ConnGetQuery(itPtr->interp, conn, NULL, NULL); /* ignoring encoding errors */
 	  if(form == NULL) {
 	    itPtr->nsconn.form[0] = '\0';
 	  } else {
@@ -855,7 +855,7 @@ Ns_QueryExists_OCaml(value ostr)
     CAMLparam1(ostr);
     int result = -1;
     Ns_Conn *conn = Ns_GetConn();
-    Ns_Set *form = conn ? Ns_ConnGetQuery(conn) : 0;
+    Ns_Set *form = conn ? Ns_ConnGetQuery(NULL, conn, NULL, NULL) : 0;
     if(form) result = Ns_SetIFind(form,String_val(ostr));
     CAMLreturn(Val_int((result >= 0)));
 }
@@ -867,7 +867,7 @@ Ns_QueryGet_OCaml(value ostr)
     CAMLlocal1(retval);
     char *result = "";
     Ns_Conn *conn = Ns_GetConn();
-    Ns_Set *form = conn ? Ns_ConnGetQuery(conn) : 0;
+    Ns_Set *form = conn ? Ns_ConnGetQuery(NULL, conn, NULL, NULL) : 0;
     if(form) result = Ns_SetIGet(form,String_val(ostr));
     retval = copy_string2(result);
     CAMLreturn(retval);
@@ -880,7 +880,7 @@ Ns_QueryGetAll_OCaml(value ostr)
     CAMLlocal3(result,nrec,orec);
     int i;
     Ns_Conn *conn = Ns_GetConn();
-    Ns_Set *form = conn ? Ns_ConnGetQuery(conn) : 0;
+    Ns_Set *form = conn ? Ns_ConnGetQuery(NULL, conn, NULL, NULL) : 0;
 
     result = Val_int(0); /* [] */
     for(i = 0;form && i < form->size;i++) {
